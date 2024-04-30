@@ -7,6 +7,7 @@ class GlobalIndenter:
         class StreamProxy:
             def __init__(self, stream):
                 self.stream = stream
+                self.encoding = getattr(stream, "encoding")
             def write(self, stuff):
                 self.stream.write(
                     textwrap.indent(stuff, '  ' * GlobalIndenter.LEVEL)
@@ -23,8 +24,16 @@ class GlobalIndenter:
         sys.stderr = self.stderr
 
 class IndentationGuard:
+    def __init__(self, prefix=None, postfix=None) -> None:
+        self.prefix = prefix
+        self.postfix = postfix
+
     def __enter__(self):
+        if self.prefix is not None:
+            print(self.prefix)
         GlobalIndenter.LEVEL += 1
 
     def __exit__(self, exception_type, exception_value, traceback):
         GlobalIndenter.LEVEL -= 1
+        if self.postfix is not None:
+            print(self.postfix)

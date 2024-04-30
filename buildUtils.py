@@ -6,10 +6,30 @@ import subprocess
 import logging
 import indenter
 import shell
+from collections import OrderedDict
+from ruamel.yaml.comments import CommentedKeyMap, CommentedKeySeq
 from ruamel.yaml.scalarstring import (
     SingleQuotedScalarString
     , DoubleQuotedScalarString
 )
+
+def action_log(type, name, value="started"):
+    return f"{type: <9} [{name}] {value}"
+
+def action_log_end(type, name, value="finished"):
+    return f" => {type: <9} [{name}] {value}"
+
+def is_tuple(value):
+    return isinstance(value, tuple)
+
+def is_sequence(value):
+    return isinstance(value, list) or isinstance(value, set) or isinstance(value, CommentedKeySeq)
+
+def is_mapping(value):
+    return isinstance(value, dict) or isinstance(value, CommentedKeyMap)
+
+def ensure_sequence(value):
+    return value if is_sequence(value) else [value]
 
 def construct(cls, constructor, node):
     if isinstance(node, ruamel.yaml.ScalarNode):
@@ -19,17 +39,32 @@ def construct(cls, constructor, node):
             return cls(DoubleQuotedScalarString(node.value, anchor=node.anchor))
         return cls(node.value)
     elif isinstance(node, ruamel.yaml.SequenceNode):
-        return constructor.construct_sequence()
+        # constructor._preserve_quotes = True
+        try:
+            return cls(*constructor.construct_sequence(node))
+        except TypeError as e:
+            raise RuntimeError(f"Cannot construct class '{cls.__name__}'") from e
+    # constructor._preserve_quotes = True
     data = ruamel.yaml.CommentedMap()
     constructor.construct_mapping(node, maptyp=data, deep=True)
+    data = {variable.replace("-", "_"): value for variable, value in data.items()}
     try:
         return cls(**data)
     except TypeError as e:
         raise RuntimeError(f"Cannot construct class '{cls.__name__}'") from e
 
+# Hashable dictionary class
+class HashableDict(dict):
+    def __hash__(self) -> int:
+        return id(self)
+
+# Custom Exception class
+class BuildError(RuntimeError):
+    pass
+
 # Base Class
 class Executable:
-    yaml_tag = None
+    yaml_tag = ""
     @classmethod
     def from_yaml(cls, constructor, node):
         return construct(cls, constructor, node)
@@ -42,138 +77,217 @@ class Executable:
         return representer.represent_mapping(
             cls.yaml_tag
             , {
-                attribute.strip("_"): value
+                attribute.strip("_").replace("_", "-"): value
                 for attribute, value in vars(self).items()
             }
         )
     def __call__(self, _):
-        raise RuntimeError(f"Executable Class '{type(self)}' has no implementation!")
+        raise BuildError(f"Executable Class '{type(self)}' has no implementation!")
+    @property
+    def type(self):
+        return type(self).yaml_tag[1:]
+    @property
+    def description(self):
+        return self.type
+    def print_prefix(self):
+        pass
+    def print_postfix(self):
+        pass
+    def prefix(self, *args):
+        return action_log(self.type, self.description, *args)
+    def postfix(self, *args):
+        return action_log_end(self.type, self.description, *args)
+
+class ExecutableBlock(Executable):
+    def print_prefix(self):
+        print(self.prefix())
+    def print_postfix(self):
+        print(self.postfix())
 
 class Path(Executable):
     yaml_tag = "!path"
-    def __init__(self, value):
-        self.value = value
-    def __call__(self, scope):
-        return os.path.normpath(execute(self.value, scope))
+    def __init__(self, *parts):
+        self.parts = parts
+    def __call__(self, scope, **args):
+        return os.path.normpath(os.path.join(*execute(self.parts, scope)))
+
+class Python(ExecutableBlock):
+    yaml_tag = "!python"
+    def __init__(self, code):
+        self.code = code
+    def __call__(self, scope, **args):
+        return exec(self.code, {}, scope)
 
 class Assert(Executable):
     yaml_tag = "!assert"
     def __init__(self, predicate):
         self.predicate = predicate
-    def __call__(self, scope):
+    def __call__(self, scope, **args):
         if not execute(self.predicate, scope):
-            raise RuntimeError(f"assertion failed: {self.predicate}")
+            raise BuildError(f"assertion failed: {self.predicate}")
 
 class Info(Executable):
     yaml_tag = "!info"
     def __init__(self, message):
         self.message = message
-    def __call__(self, scope):
-        return logging.info(self.message.format_map(scope))
+    def __call__(self, scope, **args):
+        message = execute(self.message, scope, str_is_python=False)
+        print(f"info      {message}")
 
 class Warning(Executable):
     yaml_tag = "!warning"
     def __init__(self, message):
         self.message = message
-    def __call__(self, scope):
+    def __call__(self, scope, **args):
         return logging.warning(self.message.format_map(scope))
 
 class Error(Executable):
     yaml_tag = "!error"
     def __init__(self, message):
         self.message = message
-    def __call__(self, scope):
+    def __call__(self, scope, **args):
         return logging.error(self.message.format_map(scope))
 
 class Debug(Executable):
     yaml_tag = "!debug"
     def __init__(self, message):
         self.message = message
-    def __call__(self, scope):
+    def __call__(self, scope, **args):
         return logging.debug(self.message.format_map(scope))
 
-class FileExists(Executable):
+class FileExists(ExecutableBlock):
     yaml_tag = "!file.exists"
     def __init__(self, file):
         self.file = file
-    def __call__(self, scope):
+    def __call__(self, scope, **args):
         return os.path.isfile(execute(self.file, scope))
+    @property
+    def description(self):
+        return self.file
 
-class FileRemove(Executable):
+class FileRemove(ExecutableBlock):
     yaml_tag = "!file.remove"
-    def __init__(self, file):
-        self.file = file
-    def __call__(self, scope):
-        return os.remove(execute(self.file, scope))
+    def __init__(self, file, must_exist=False):
+        self.file       = file
+        self.must_exist = must_exist
+    def __call__(self, scope, **args):
+        file = execute(self.file, scope)
+        if os.path.isfile(file):
+            print(f" - found file: {file}")
+            os.remove(file)
+            return True
+        print(f" - file not found: {file}")
+        if self.must_exist:
+            raise BuildError("cannot remove non-existent file")
+        return False
+    @property
+    def description(self):
+        return self.file
 
-class FileCopy(Executable):
+class FileCopy(ExecutableBlock):
     yaml_tag = "!file.copy"
     def __init__(self, **arguments):
-        self.from_ = arguments["from"]
-        self.to_ = arguments["to"]
-    def __call__(self, scope):
-        return shutil.copyfile(execute(self.from_, scope), execute(self.to_, scope))
+        self.from_      = arguments["from"]
+        self.to_        = arguments["to"]
+        self.must_exist = arguments.get("must_exist", True)
+        self.make_dirs  = arguments.get("make_dirs", True)
+        self.override   = arguments.get("override", True)
+    def __call__(self, scope, **args):
+        source      = execute(self.from_, scope)
+        destination = execute(self.to_, scope)
+        if os.path.isfile(source):
+            print(f" - found source: {source}")
+            if self.make_dirs:
+                destination_dir = os.path.dirname(destination)
+                if destination_dir and not os.path.isdir(destination_dir):
+                    print(f" - creating destination directory: {destination_dir}")
+                    os.makedirs(destination_dir)
+            try:
+                print(f" - destination: {destination}")
+                shutil.copyfile(source, destination)
+                return True
+            except Exception as e:
+                raise BuildError("error during copying") from e
+        elif self.must_exist:
+            raise BuildError(f"cannot copy non-existent file: {source}")
+        return False
+    @property
+    def description(self):
+        return self.from_
 
-class Shell(Executable):
-    yaml_tag = "!shell"
-    def __init__(self, program=None, cwd=None, args=None, check=True, display=False, success=None, explicit_shell=False):
+class Call(ExecutableBlock):
+    yaml_tag = "!call"
+    def __init__(
+        self
+        , program=None          # Path to executable
+        , cwd=None              # Directory from where to execute the program
+        , args=None             # List or dictionary of arguments
+        , check=True            # Whether to check the return value of the application to be zero
+        , print=True            # Whether to print stdout and stderr of the execution
+        , on_success=None       # What to execute, when the return value is zero
+        , on_fail=None          # What to execute, when the return value is non-zerp (set "check=False" first)
+        , shell=False           # Whether to use an explicit shell to dispatch the command
+        , log_file=None         # Path to log file, if one shall be created
+    ):
         self.program = program
         self.cwd = cwd
         self.args = args
         self.check = check
-        self.display = display
-        self.success = success
-        self.explicit_shell = explicit_shell
-    def __call__(self, scope):
-        command     = [execute(self.program, scope)]
-        arguments   = self.args
-        if not isinstance(self.args, dict) and not isinstance(self.args, list):
-            arguments = execute(self.args, scope)
-        if isinstance(arguments, dict):
-            arguments = [{parameter: value} for parameter, value in arguments.items()]
-        elif not isinstance(arguments, list):
+        self.print = print
+        self.log_file = log_file
+        self.on_success = on_success
+        self.on_fail = on_fail
+        self.shell = shell
+    @property
+    def description(self):
+        return self.program
+    def __call__(self, scope, **args):
+        command    = [execute(self.program, scope)]
+        arguments  = execute(self.args, scope)
+        if not is_sequence(arguments):
             arguments = [arguments]
-        actual_arguments = []
-        for argument in arguments:
-            if isinstance(argument, dict):
-                assert len(argument) == 1
-                parameter, value = next(iter(argument.items()))
-                if not parameter:
-                    argument = value
-            if isinstance(argument, list):
-                actual_arguments.extend(argument)
-            else:
-                actual_arguments.append(argument)
-        for argument in actual_arguments:
-            if isinstance(argument, dict):
-                assert len(argument) == 1
-                parameter, value = next(iter(argument.items()))
-                parameter   = execute(parameter, scope, str_is_python=False)
-                value       = execute(value, scope)
-                argument = f"--{parameter}"
-                if value is None:
-                    value = []
-                elif not isinstance(value, list):
-                    value = [value]
-                for val in value:
-                    val = str(val)
-                    argument += f' "{val}"' if val.count(" ") else f" {val}"
-                command.append(argument)
-            else:
-                argument = execute(argument, scope)
-                argument = str(argument)
-                argument = f'"{argument}"' if argument.count(" ") else f" {argument}"
-                command.append(argument)
+        for argument_or_list in arguments:
+            if not is_sequence(argument_or_list):
+                argument_or_list = [argument_or_list]
+            for argument in argument_or_list:
+                if is_mapping(argument):
+                    for parameter, value in argument.items():
+                        argument = f"--{parameter}"
+                        if value is None:
+                            value = []
+                        elif not is_sequence(value):
+                            value = [value]
+                        for val in value:
+                            val = str(val)
+                            argument += f' "{val}"' if val.count(" ") else f" {val}"
+                        command.append(argument)
+                else:
+                    argument = str(argument)
+                    if argument:
+                        argument = f'"{argument}"' if argument.count(" ") else f" {argument}"
+                        command.append(argument)
+
         options = {}
-        options["cwd"] = execute(self.cwd, scope)
-        options["shell"] = True if execute(self.explicit_shell, scope) else False
-        print(f"shell [{self.program}]...")
+        options["cwd"] = os.path.abspath(execute(self.cwd, scope) or os.curdir)
+        options["shell"] = True if execute(self.shell, scope) else False
+        options["print_out"] = True if execute(self.print, scope) else False
+        if log_file := execute(self.log_file, scope):
+            options["print_file"] = open(log_file, "wb")
+
+        print(" - command: ")
+        prefix = "     "
+        for part in command:
+            print(prefix + part.strip())
+            prefix = "       "
+        print(f" - working directory: {options['cwd']}")
+        print(" - executing...")
         with indenter.IndentationGuard():
             result = shell.shell(" ".join(command), **options)
-        print(f" => shell [{self.program}] finished with return code {result.returncode}")
+        print(f" - ...finished with return code {result.returncode}")
+
         if execute(self.check, scope):
             if result.returncode != 0:
-                raise RuntimeError("Shell call returned non-zero status code!")
+                raise BuildError("call returned non-zero status code!")
         return result.returncode
 
 class For(Executable):
@@ -183,34 +297,43 @@ class For(Executable):
         self.in_ = arguments.get("in")
         self.do_ = arguments.get("do")
         self.flatten = arguments.get("flatten", False)
-    def __call__(self, scope):
-        iterable = execute(self.for_, scope)
+    def __call__(self, scope, **args):
+        variable = execute(self.for_, scope, str_is_python=False)
+        iterable = execute(self.in_, scope)
         result = []
         for element in iterable:
-            if isinstance(self.in_, list):
-                for variable, part in zip(self.in_, element):
-                    scope[variable] = part
+            if is_sequence(variable):
+                for sub_variable, part in zip(variable, element):
+                    scope[sub_variable] = part
             else:
                 scope[variable] = element
-            if isinstance(self.do_, list):
+            if is_sequence(self.do_):
                 results = []
                 for statement in self.do_:
-                    results.append(execute(statement, scope))
+                    results.append(execute(
+                        statement
+                        , scope
+                        , dict_is_assignment=args["dict_is_assignment"]
+                    ))
                 if self.flatten:
                     result.extend(results)
                 else:
                     result.append(results)
             else:
-                result += execute(self.do_, scope)
+                result.append(execute(
+                    self.do_
+                    , scope
+                    , dict_is_assignment=args["dict_is_assignment"]
+                ))
         return result
 
 class If(Executable):
     yaml_tag = "!if"
     def __init__(self, **arguments):
-        self.if_ = arguments["if"]
-        self.then_ = arguments["then"]
-        self.else_ = arguments.get("else", None)
-    def __call__(self, scope):
+        self.if_    = arguments.get("when") or arguments.get("condition") or arguments["if"]
+        self.then_  = arguments["then"]
+        self.else_  = arguments.get("else", None)
+    def __call__(self, scope, **args):
         if execute(self.if_, scope):
             return execute(self.then_, scope)
         return execute(self.else_, scope)
@@ -219,28 +342,30 @@ class Set(Executable):
     yaml_tag = "!set"
     def __init__(self, **assignments):
         self.assignments = assignments
-    def __call__(self, scope):
+    def __call__(self, scope, **args):
         for variable, value in self.assignments.items():
             value = execute(value, scope)
             variable = execute(variable, scope, str_is_python=False)
-            print(f"variable [{variable}] = {value}")
+            print(action_log("variable", variable, f"= {value}"))
             scope[variable] = value
 
 yaml = ruamel.yaml.YAML()
+yaml.preserve_quotes=True
+yaml.register_class(Python)
 yaml.register_class(Path)
 yaml.register_class(Assert)
 yaml.register_class(Info)
 yaml.register_class(FileExists)
 yaml.register_class(FileRemove)
 yaml.register_class(FileCopy)
-yaml.register_class(Shell)
+yaml.register_class(Call)
 yaml.register_class(For)
 yaml.register_class(If)
 yaml.register_class(Set)
-yaml.preserve_quotes=True
 
 def load_config(path):
-    return yaml.load(open(path, "rt", encoding="iso-8859-1").read())
+    result = yaml.load(open(path, "rt", encoding="iso-8859-1").read())
+    return result
 
 class Scope:
     def __init__(self, variables=None, base=None):
@@ -265,29 +390,45 @@ class Scope:
             return getattr(self, key)
         return self[key]
 
-def execute(value, scope, str_is_python=True, deep=True):
+def execute(
+    value
+    , scope
+    , str_is_python=None
+    , dict_is_assignment=False
+    , deep=True
+):
     if isinstance(value, Executable):
-        return value.__call__(scope)
+        value.print_prefix()
+        result = value(
+            scope
+            , str_is_python=str_is_python
+            , dict_is_assignment=dict_is_assignment
+            , deep=deep
+        )
+        value.print_postfix()
+        value = result
     elif isinstance(value, str):
         if isinstance(value, DoubleQuotedScalarString):
             str_is_python = False
         elif isinstance(value, SingleQuotedScalarString):
             str_is_python = True
-        if not str_is_python:
+        elif str_is_python is None:
+            str_is_python = True
+        if str_is_python == False:
             value = "f"+repr(value)
         return eval(value, {}, scope)
-    elif value is None:
-        return value
-    elif isinstance(value, bool):
-        return value
-    elif isinstance(value, dict) and deep:
-        return {
-            execute(attr, scope, str_is_python=False)
-            : execute(val, scope)
-            for attr, val in value.items()
-        }
-    elif isinstance(value, list) and deep:
-        return [execute(val, scope) for val in value]
-    else:
-        raise RuntimeError(f"Unsupported statement of type '{type(value)}'")
+    elif is_mapping(value) and deep:
+        result = HashableDict()
+        for variable, value in value.items():
+            value       = execute(value, scope, str_is_python=str_is_python)
+            variable    = execute(variable, scope, str_is_python=False)
+            if dict_is_assignment:
+                print(action_log("variable", variable, f"= {value}"))
+                scope[variable] = value
+            result[variable] = value
+        value = result
+    elif is_sequence(value) and deep:
+        return [execute(val, scope, str_is_python=str_is_python) for val in value]
+    elif is_tuple(value) and deep:
+        return (execute(val, scope, str_is_python=str_is_python) for val in value)
     return value
