@@ -8,7 +8,7 @@ from ruamel.yaml.scalarstring import (
     , DoubleQuotedScalarString
 )
 
-import indenter
+import stream_modifier
 import shell
 
 def action_log(action_type, name, value="started"):
@@ -111,6 +111,17 @@ class Path(Executable):
         self.parts = parts
     def __call__(self, scope, **_):
         return os.path.normpath(os.path.join(*execute(self.parts, scope)))
+
+class Format(Executable):
+    yaml_tag = "!format"
+    def __init__(self, value):
+        self.value = value
+    def __call__(self, scope, **_):
+        return execute(
+            str(execute(self.value, scope))
+            , scope
+            , str_is_python=False
+        )
 
 class Python(ExecutableBlock):
     yaml_tag = "!python"
@@ -282,7 +293,7 @@ class Call(ExecutableBlock):
             prefix = "       "
         print(f" - working directory: {options['cwd']}")
         print(" - executing...")
-        with indenter.IndentationGuard():
+        with stream_modifier.Indent():
             result = shell.shell(" ".join(command), **options)
         print(f" - ...finished with return code {result.returncode}")
 
@@ -354,6 +365,7 @@ yaml = ruamel.yaml.YAML()
 yaml.preserve_quotes=True
 yaml.register_class(Python)
 yaml.register_class(Path)
+yaml.register_class(Format)
 yaml.register_class(Assert)
 yaml.register_class(Info)
 yaml.register_class(FileExists)
