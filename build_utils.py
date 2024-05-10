@@ -11,20 +11,50 @@ from ruamel.yaml.scalarstring import (
 import stream_modifier
 import shell
 
-def action_log(action_type, name, value="started"):
-    return f"{action_type: <9} [{name}] {value}"
-
-def action_log_end(action_type, name, value="finished"):
-    return f" => {action_type: <9} [{name}] {value}"
-
 def is_tuple(value):
     return isinstance(value, tuple)
 
 def is_sequence(value):
-    return isinstance(value, list) or isinstance(value, set) or isinstance(value, CommentedKeySeq)
+    return (
+        isinstance(value, list)
+        or isinstance(value, set)
+        or isinstance(value, tuple)
+        or isinstance(value, CommentedKeySeq)
+    )
 
 def is_mapping(value):
     return isinstance(value, dict) or isinstance(value, CommentedKeyMap)
+
+def is_printable(value, fail_fast_length=7):
+    if value is None:
+        return True
+    elif any(isinstance(value, type) for type in [str, bool, int, float, complex]):
+        return True
+    elif is_sequence(value):
+        if len(value) > fail_fast_length:
+            return False
+        for v in value:
+            if not is_printable(v, fail_fast_length/len(value) if fail_fast_length is not None else None):
+                return False
+        return True
+    elif is_mapping(value):
+        if fail_fast_length is not None and len(value) > fail_fast_length:
+            return False
+        for k, v in value.items():
+            if not is_printable(k, fail_fast_length/len(value) if fail_fast_length is not None else None):
+                return False
+            if not is_printable(v, fail_fast_length/len(value) if fail_fast_length is not None else None):
+                return False
+        return True
+    return hasattr(value, '__dict__') and '__str__' in value.__dict__
+
+def intelligent_repr(value, max_length=1000):
+    print_normally = is_printable(value, max_length/4)
+    if print_normally:
+        result = repr(value)
+        if len(result) <= max_length:
+            return result
+    return f"{type(value).__module__}.{type(value).__qualname__}@{id(value)}"
 
 def ensure_sequence(value):
     return value if is_sequence(value) else [value]
@@ -88,42 +118,56 @@ class Executable:
     def type(self):
         return type(self).yaml_tag[1:]
     @property
+    def detail(self):
+        return None
+    @property
+    def print_indented(self):
+        return True
+    @property
     def description(self):
-        return self.type
-    def print_prefix(self):
-        pass
-    def print_postfix(self):
-        pass
-    def prefix(self, *args):
-        return action_log(self.type, self.description, *args)
-    def postfix(self, *args):
-        return action_log_end(self.type, self.description, *args)
-
-class ExecutableBlock(Executable):
-    def print_prefix(self):
-        print(self.prefix())
-    def print_postfix(self):
-        print(self.postfix())
+        result = self.type
+        if self.detail:
+            result += f" [{self.detail}]"
+        return result
+    @property
+    def print_description(self):
+        return True
 
 class Path(Executable):
     yaml_tag = "!path"
     def __init__(self, *parts):
         self.parts = parts
     def __call__(self, scope, **_):
-        return os.path.normpath(os.path.join(*execute(self.parts, scope)))
+        parts = [execute(part, scope) for part in self.parts]
+        parts = [
+            part.replace('"', '') if isinstance(part, str) else part
+            for part in parts
+            if part is not None
+        ]
+        if parts:
+            return os.path.normpath(os.path.join(*parts))
+        return None
+    @property
+    def print_description(self):
+        return False
 
 class Format(Executable):
     yaml_tag = "!format"
-    def __init__(self, value):
-        self.value = value
+    def __init__(self, pattern, *args, **kwargs):
+        self.pattern    = pattern
+        self.args       = args or kwargs or None
     def __call__(self, scope, **_):
-        return execute(
-            str(execute(self.value, scope))
-            , scope
-            , str_is_python=False
-        )
+        args    = execute(self.args, scope)
+        if is_sequence(self.args):
+            return str(execute(self.pattern, scope)) % args
+        elif is_mapping(self.args):
+            scope = Scope(args, scope)
+        return execute(self.pattern, scope, str_is_python=False)
+    @property
+    def print_description(self):
+        return False
 
-class Python(ExecutableBlock):
+class Python(Executable):
     yaml_tag = "!python"
     def __init__(self, code):
         self.code = code
@@ -132,11 +176,18 @@ class Python(ExecutableBlock):
 
 class Assert(Executable):
     yaml_tag = "!assert"
-    def __init__(self, predicate):
+    def __init__(self, predicate, message=None):
         self.predicate = predicate
+        self.message = message
     def __call__(self, scope, **_):
         if not execute(self.predicate, scope):
+            if self.message:
+                raise BuildError(execute(self.message, scope))
             raise BuildError(f"assertion failed: {self.predicate}")
+        print("ok")
+    @property
+    def detail(self):
+        return self.predicate
 
 class Info(Executable):
     yaml_tag = "!info"
@@ -145,6 +196,17 @@ class Info(Executable):
     def __call__(self, scope, **_):
         message = execute(self.message, scope, str_is_python=False)
         print(f"info      {message}")
+
+class Important(Executable):
+    yaml_tag = "!important"
+    def __init__(self, message):
+        self.message = message
+    def __call__(self, scope, **_):
+        message = str(execute(self.message, scope, str_is_python=False))
+        line_length = max([len(line) for line in message.splitlines()])
+        print("-" * line_length)
+        print(message)
+        print("-" * line_length)
 
 class Warning(Executable):  # pylint: disable=redefined-builtin
     yaml_tag = "!warning"
@@ -167,7 +229,7 @@ class Debug(Executable):
     def __call__(self, scope, **_):
         return logging.debug(self.message.format_map(scope))
 
-class FileExists(ExecutableBlock):
+class FileExists(Executable):
     yaml_tag = "!file.exists"
     def __init__(self, file):
         self.file = file
@@ -177,7 +239,7 @@ class FileExists(ExecutableBlock):
     def description(self):
         return self.file
 
-class FileRemove(ExecutableBlock):
+class FileRemove(Executable):
     yaml_tag = "!file.remove"
     def __init__(self, file, must_exist=False):
         self.file       = file
@@ -196,7 +258,7 @@ class FileRemove(ExecutableBlock):
     def description(self):
         return self.file
 
-class FileCopy(ExecutableBlock):
+class FileCopy(Executable):
     yaml_tag = "!file.copy"
     def __init__(self, **arguments):
         self.from_      = arguments["from"]
@@ -227,19 +289,46 @@ class FileCopy(ExecutableBlock):
     def description(self):
         return self.from_
 
-class Call(ExecutableBlock):
+class YamlRead(Executable):
+    yaml_tag = "!yaml.read"
+    def __init__(self, file):
+        self.file = file
+    def __call__(self, scope, **_):
+        with open(execute(self.file, scope), "rt", encoding="iso-8859-1") as file:
+            parser = ruamel.yaml.YAML()
+            return parser.load(file.read())
+    @property
+    def detail(self):
+        return self.file
+
+class YamlWrite(Executable):
+    yaml_tag = "!yaml.write"
+    def __init__(self, file, data):
+        self.file = file
+        self.data = data
+    def __call__(self, scope, **_):
+        data = execute(self.data, scope)
+        with open(execute(self.file, scope), "wt", encoding="iso-8859-1") as file:
+            parser = ruamel.yaml.YAML()
+            parser.dump(data, file)
+    @property
+    def description(self):
+        return self.file
+
+class Call(Executable):
     yaml_tag = "!call"
     def __init__(   # pylint: disable=redefined-builtin, redefined-outer-name
         self
-        , program=None          # Path to executable
-        , cwd=None              # Directory from where to execute the program
-        , args=None             # List or dictionary of arguments
-        , check=True            # Whether to check the return value of the application to be zero
-        , print=True            # Whether to print stdout and stderr of the execution
-        , on_success=None       # What to execute, when the return value is zero
-        , on_fail=None          # What to execute, when the return value is non-zerp (set "check=False" first)
-        , shell=False           # Whether to use an explicit shell to dispatch the command
-        , log_file=None         # Path to log file, if one shall be created
+        , program=None              # Path to executable
+        , cwd=None                  # Directory from where to execute the program
+        , args=None                 # List or dictionary of arguments
+        , check=True                # Whether to check the return value of the application to be zero
+        , print=True                # Whether to print stdout and stderr of the execution
+        , on_success=None           # What to execute, when the return value is zero
+        , on_fail=None              # What to execute, when the return value is non-zerp (set "check=False" first)
+        , shell=False               # Whether to use an explicit shell to dispatch the command
+        , log_file=None             # Path to log file, if one shall be created
+        , separate_process=False    # Whether to execute as process (perhaps multi-processor), instead of subprocess (same process)
     ):
         self.program = program
         self.cwd = cwd
@@ -250,8 +339,9 @@ class Call(ExecutableBlock):
         self.on_success = on_success
         self.on_fail = on_fail
         self.shell = shell
+        self.separate_process = separate_process
     @property
-    def description(self):
+    def detail(self):
         return self.program
     def __call__(self, scope, **_):
         command    = [execute(self.program, scope)]
@@ -283,19 +373,22 @@ class Call(ExecutableBlock):
         options["cwd"] = os.path.abspath(execute(self.cwd, scope) or os.curdir)
         options["shell"] = True if execute(self.shell, scope) else False
         options["print_out"] = True if execute(self.print, scope) else False
+        options["separate_process"] = True if execute(self.separate_process, scope) else False
         if log_file := execute(self.log_file, scope):
             options["print_file"] = open(log_file, "wb")
 
-        print(" - command: ")
-        prefix = "     "
+        print("command: ")
+        prefix = "  "
         for part in command:
             print(prefix + part.strip())
-            prefix = "       "
-        print(f" - working directory: {options['cwd']}")
-        print(" - executing...")
-        with stream_modifier.Indent():
-            result = shell.shell(" ".join(command), **options)
-        print(f" - ...finished with return code {result.returncode}")
+            prefix = "    "
+        print(f"working directory: {options['cwd']}")
+        print("executing...")
+        with stream_modifier.Prefix("  "):
+            with stream_modifier.EliminateLogging():
+                result = shell.shell(" ".join(command), **options)
+        print(f"finished, took {result.duration:.2f}s")
+        print(f"return code: {result.returncode}")
 
         if execute(self.check, scope):
             if result.returncode != 0:
@@ -349,6 +442,9 @@ class If(Executable):
         if execute(self.if_, scope):
             return execute(self.then_, scope, dict_is_assignment=args["dict_is_assignment"])
         return execute(self.else_, scope, dict_is_assignment=args["dict_is_assignment"])
+    @property
+    def print_description(self):
+        return False
 
 class Set(Executable):
     yaml_tag = "!set"
@@ -358,8 +454,11 @@ class Set(Executable):
         for variable, value in self.assignments.items():
             value       = execute(value, scope)
             variable    = execute(variable, scope, str_is_python=False)
-            print(action_log("variable", variable, f"= {value}"))
+            print(f"variable [{variable}] = {intelligent_repr(value)}")
             scope[variable] = value
+    @property
+    def print_indented(self):
+        return False
 
 yaml = ruamel.yaml.YAML()
 yaml.preserve_quotes=True
@@ -368,9 +467,12 @@ yaml.register_class(Path)
 yaml.register_class(Format)
 yaml.register_class(Assert)
 yaml.register_class(Info)
+yaml.register_class(Important)
 yaml.register_class(FileExists)
 yaml.register_class(FileRemove)
 yaml.register_class(FileCopy)
+yaml.register_class(YamlRead)
+yaml.register_class(YamlWrite)
 yaml.register_class(Call)
 yaml.register_class(For)
 yaml.register_class(If)
@@ -387,6 +489,8 @@ class Scope:
     def __getitem__(self, key):
         if key in self.__variables:
             return self.__variables[key]
+        if isinstance(key, int):
+            return self.__variables[self.__variables.keys()[key]]
         if self.__base:
             return self.__base[key]
         raise AttributeError
@@ -399,9 +503,25 @@ class Scope:
             return key in self.__base
         return False
     def __getattr__(self, key):
-        if key in ["__variables", "__base"]:
+        if key in vars(Scope):
             return getattr(self, key)
         return self[key]
+    def __len__(self):
+        return len(self.__variables)
+    def get(self, key, fallback=None):
+        if key in self.__variables:
+            return self.__variables[key]
+        if self.__base:
+            return self.__base[key]
+        return fallback
+    def to_dict(self):
+        result = {}
+        if self.__base:
+            result.update(self.__base.items())
+        result.update(self.__variables)
+        return result
+    def items(self):
+        return self.to_dict().items()
 
 def execute(
     value
@@ -411,15 +531,16 @@ def execute(
     , deep=True
 ):
     if isinstance(value, Executable):
-        value.print_prefix()
-        result = value(
-            scope
-            , str_is_python=str_is_python
-            , dict_is_assignment=dict_is_assignment
-            , deep=deep
-        )
-        value.print_postfix()
-        value = result
+        if value.print_description:
+            print(value.description)
+        with stream_modifier.Prefix("  ") if value.print_indented else stream_modifier.Noop():
+            result = value(
+                scope
+                , str_is_python=str_is_python
+                , dict_is_assignment=dict_is_assignment
+                , deep=deep
+            )
+            value = result
     elif isinstance(value, str):
         if isinstance(value, DoubleQuotedScalarString):
             str_is_python = False
@@ -436,7 +557,7 @@ def execute(
             value       = execute(value, scope, str_is_python=str_is_python)
             variable    = execute(variable, scope, str_is_python=False)
             if dict_is_assignment:
-                print(action_log("variable", variable, f"= {value}"))
+                print(f"variable [{variable}] = {intelligent_repr(value)}")
                 scope[variable] = value
             result[variable] = value
         value = result

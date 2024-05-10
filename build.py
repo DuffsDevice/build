@@ -1,35 +1,56 @@
 import build_utils
 import stream_modifier
+import time
+import threading
+from concurrent import futures
 from functools import cmp_to_key
 
-from build_utils import action_log, action_log_end
-
 def build(
-    config
+    target_definitions_yaml_path
     , targets
-    , information=None
+    , scope=None
+    , variants=None
     , skip_targets=None
     , from_targets=None
-):  # pylint: disable=redefined-outer-name, dangerous-default-value
+):
+    # Preformat inputs
+    if variants is None:
+        variants    = [("default", {})]
+    elif isinstance(variants, int):
+        variants    = [(i, {}) for i in range(variants)]
+    elif build_utils.is_sequence(variants):
+        variants    = [(str(variant), {}) for variant in variants]
+    else:
+        assert build_utils.is_mapping(variants)
+        variants    = [
+            (str(variant), data)
+            for variant, data in variants.items()
+        ]
 
-    information     = information or {}
+    scope           = scope or {}
     skip_targets    = skip_targets or []
+    skip_targets    = skip_targets if build_utils.is_sequence(skip_targets) else [skip_targets]
     from_targets    = from_targets or []
+    from_targets    = from_targets if build_utils.is_sequence(from_targets) else [from_targets]
+    targets         = targets or []
     targets         = targets if build_utils.is_sequence(targets) else [targets]
+
+    # Parse build yaml
+    target_definitions = build_utils.load_config(target_definitions_yaml_path)
 
     # Ensure all targets and subtarget skips exist
     for target in targets:
-        if target not in config:
+        if target not in target_definitions:
             raise build_utils.BuildError(
                 f"Build target '{target} could not be found in the build config!"
             )
     for subtarget in skip_targets:
-        if subtarget not in config:
+        if subtarget not in target_definitions:
             raise build_utils.BuildError(
                 f"Skip subtarget '{subtarget}' could not be found in the build config!"
             )
     for subtarget in from_targets:
-        if subtarget not in config:
+        if subtarget not in target_definitions:
             raise build_utils.BuildError(
                 f"From subtarget '{subtarget}' could not be found in the build config!"
             )
@@ -46,7 +67,7 @@ def build(
         if subtarget in visited_subtargets:
             return
         visited_subtargets.add(subtarget)
-        for required_subtarget in config[subtarget].get("requires", []):
+        for required_subtarget in target_definitions[subtarget].get("requires", []):
             resolve_required_subtargets(required_subtarget, subtarget)
         subtargets.append(subtarget)
 
@@ -70,9 +91,9 @@ def build(
 
     # Sort list of subtargets from least depending to most depending
     def rank_subtargets(left, right):
-        if right in config[left].get("requires", []):
+        if right in target_definitions[left].get("requires", []):
             return 1
-        if left in config[right].get("requires", []):
+        if left in target_definitions[right].get("requires", []):
             return -1
         return 0
     subtargets.sort(key=cmp_to_key(rank_subtargets))
@@ -86,68 +107,151 @@ def build(
                     f"'{subtargets[i]}' and '{subtargets[j]}' detected!"
                 )
 
+    # Create all involved semaphores
+    semaphores = set()
+    for subtarget in subtargets:
+        semaphores.update(target_definitions[subtarget].get("locks", []))
+    for semaphore in semaphores:
+        scope[semaphore] = threading.Semaphore()
+
+    # Print Targets
     print("targets:")
     for target in targets:
         print(f" - {target}")
+    print()
+
+    # Print all Subtargets
     print("required subtargets:")
     for index, subtarget in enumerate(subtargets, 1):
         origins = subtarget_parents.get(subtarget, [])
         if len(origins) > 3:
             origins = [*origins[0:3], f"and {len(origins)} other (sub)targets"]
         print(
-            f" {index: >2}. "
-            + (f"=> {subtarget}" if subtarget in target else subtarget)
+            f" {index: >2}|"
+            + subtarget
             + (f" (required by {', '.join(origins)})" if origins else "")
         )
+    print()
+
+    # Print variants that will be built
+    print("variants:")
+    for variant, data in variants:
+        print(f" - {build_utils.intelligent_repr(variant)}")
+        if data:
+            for variable, value in data.items():
+                print(f"   - {variable}: {build_utils.intelligent_repr(value)}")
+    print()
+
+    # Convert variant data to scopes
+    variants = [(variant, build_utils.Scope(data, scope)) for variant, data in variants]
 
     # Set some global information
-    information["__subtargets"] = subtargets
-    information["__targets"]    = targets
+    scope["__subtargets"] = subtargets
+    scope["__targets"]    = targets
+    scope["__variants"]   = build_utils.Scope({
+        variant: scope
+        for variant, scope in variants
+    })
 
+    # Run each variant in parallel
+    print("executing")
+    results = []
+    with stream_modifier.Redirect(stream_modifier.STDERR, stream_modifier.STDOUT):
+        with stream_modifier.Scope(stream_modifier.STDOUT):
+            with futures.ThreadPoolExecutor(len(variants)) as pool:
+                for variant, variant_scope in variants:
+                    results.append(pool.submit(
+                        build_variant
+                        , variant
+                        , variant_scope
+                        , subtargets
+                        , target_definitions
+                    ))
+
+            # Wait for all results to be completed
+            futures.wait(results)
+            results = [future.result() for future in results]
+            result = all(results)
+
+    return result
+
+def build_variant(
+    variant
+    , scope
+    , subtargets
+    , target_definitions
+):
     # Set all available targets to None
-    for possible_target in config:
-        information[possible_target] = None
+    for possible_target in target_definitions:
+        scope[possible_target] = None
 
-    # Create Scopes
+    # Create a scope for each subtarget
     for index, subtarget in enumerate(subtargets):
-        information[subtarget] = build_utils.Scope(
+        scope[subtarget] = build_utils.Scope(
             {
-                "__name":       config[subtarget].get("name", subtarget)
+                "__name":       target_definitions[subtarget].get("name", subtarget)
                 , "__index":    index
                 , "__finished": False
             }
-            , information
+            , scope
         )
 
-    with stream_modifier.StreamModificationScope(stream_modifier.STDOUT, stream_modifier.STDERR):
+    # Set variant information for this scope
+    scope["__variant"] = variant
+
+    with scope.get("__modifiers", stream_modifier.Noop):
 
         # Execute Subtargets
         result = True
-        for index, subtarget in enumerate(subtargets):
-            prefix = f"({index+1}/{num_subtargets}) "
-            prefix += "target" if subtarget in targets else "subtarget"
-            with stream_modifier.Indent():
-                # Run Sets
-                for variable, value in config[subtarget].get("sets", {}).items():
-                    information[variable] = build_utils.execute(value, information[subtarget])
+        for index, subtarget in enumerate(subtargets, start=1):
 
-                # Run Steps
-                for steps in config[subtarget].get("steps", []):
-                    for step in build_utils.ensure_sequence(steps):
+            # Acquire potential semaphores
+            for semaphore_name in target_definitions[subtarget].get("locks", []):
+                semaphore = scope[semaphore_name]
+                assert isinstance(semaphore, threading.Semaphore)
+                semaphore.acquire()
+
+            # Run the build step
+            with stream_modifier.Prefix(f"{index}|"):
+                print(subtarget)
+                with stream_modifier.Indent():
+
+                    # Run Sets
+                    for variable, value in target_definitions[subtarget].get("sets", {}).items():
+                        scope[variable] = build_utils.execute(value, scope[subtarget])
+
+                    # Run Steps
+                    for step in build_utils.ensure_sequence(
+                        target_definitions[subtarget].get("steps", [])
+                    ):
                         try:
-                            information[subtarget]["__result"]  = build_utils.execute(
+                            scope[subtarget]["__result"]  = build_utils.execute(
                                 step
-                                , information[subtarget]
+                                , scope[subtarget]
                                 , dict_is_assignment=True
                             )
-                            information[subtarget]["__success"] = True
+                            scope[subtarget]["__success"] = True
                         except build_utils.BuildError as e:
-                            information[subtarget]["__success"] = False
+                            scope[subtarget]["__success"] = False
                             result = False
                             print(f" => build error: {e}")
                             break
 
-                if not result:
-                    break
+                    if result:
+                        print("ok")
+                    else:
+                        print("finished with errors")
+                        break
 
-        return result
+            # Release potential semaphores
+            for semaphore_name in target_definitions[subtarget].get("locks", []):
+                semaphore = scope[semaphore_name]
+                assert isinstance(semaphore, threading.Semaphore)
+                semaphore.release()
+
+        if result:
+            print("  ok")
+        else:
+            print("  finished with errors")
+
+    return result
